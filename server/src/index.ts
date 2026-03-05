@@ -39,6 +39,11 @@ let allSockets:User[]=[];
 let existingRooms:Set<string>=new Set();
 let roomCreators:Map<string, WebSocket>=new Map(); // roomId -> creator socket
 let pendingJoinRequests:Map<string, JoinRequest[]>=new Map(); // roomId -> pending requests
+let approvedJoinKeys:Set<string>=new Set(); // short-lived approval for reconnect to chat page
+
+function getApprovalKey(roomId: string, userName: string, avatar: number): string {
+    return `${roomId}:${userName}:${avatar}`;
+}
 
 // Helper function to generate random name
 function generateRandomName(): string {
@@ -53,9 +58,11 @@ function generateRandomName(): string {
 // Helper function to broadcast users list to all users in a room
 function broadcastUsersList(roomId: string) {
     const roomUsers = allSockets.filter(u => u.room === roomId);
+    const creatorSocket = roomCreators.get(roomId);
     const usersList = roomUsers.map(u => ({
         name: u.name,
-        avatar: u.avatar
+        avatar: u.avatar,
+        isCreator: u.socket === creatorSocket
     }));
     
     roomUsers.forEach(user => {
@@ -65,6 +72,24 @@ function broadcastUsersList(roomId: string) {
         }));
     });
 }
+
+// Helper function to broadcast a system message when a user joins a room
+function broadcastUserJoined(roomId: string, userName: string, userAvatar: number) {
+    const roomUsers = allSockets.filter(u => u.room === roomId);
+    
+    roomUsers.forEach(user => {
+        user.socket.send(JSON.stringify({
+            type: "message",
+            payload: {
+                message: `${userName} joined the room`,
+                senderName: "System",
+                senderAvatar: userAvatar,
+                isSystemMessage: true
+            }
+        }));
+    });
+}
+
 wss.on("connection",(socket)=>{
     console.log("New client connected");
     
@@ -97,7 +122,8 @@ wss.on("connection",(socket)=>{
                     if(existingUser){
                         existingUser.room = roomId;
                         existingUser.name = userName;
-                        existingUser.avatar = avatar;
+                   
+                     existingUser.avatar = avatar;
                     }
                 }else{
                     // New user, add to allSockets
@@ -108,13 +134,12 @@ wss.on("connection",(socket)=>{
                         avatar: avatar
                     });
                 }
-                
                 existingRooms.add(roomId);
                 // Set creator for this room
                 roomCreators.set(roomId, socket);
                 // Initialize pending requests for this room
                 pendingJoinRequests.set(roomId, []);
-                socket.send(JSON.stringify({type:"room_created",roomId:roomId, isCreator: true}));
+                socket.send(JSON.stringify({type:"room_created",roomId:roomId, isCreator: true, userName: userName}));
                 // Broadcast updated users list to all users in the room
                 broadcastUsersList(roomId);
             }
@@ -138,7 +163,13 @@ wss.on("connection",(socket)=>{
             
             if(existingRooms.has(roomId)){
                 const creator = roomCreators.get(roomId);
-                if(creator && creator !== socket){
+                const approvalKey = getApprovalKey(roomId, userName, avatar);
+                const isPreApproved = approvedJoinKeys.has(approvalKey);
+                if (isPreApproved) {
+                    approvedJoinKeys.delete(approvalKey);
+                }
+
+                if(creator && creator !== socket && !isPreApproved){
                     // Room has a creator, send join request
                     const requestId = `${Date.now()}-${Math.random()}`; // Unique ID
                     const request: JoinRequest = {
@@ -162,10 +193,11 @@ wss.on("connection",(socket)=>{
                         }
                     }));
                     
-                    // Notify requester that request was sent
+                    // Notify requester that request was sent (include server-assigned name)
                     socket.send(JSON.stringify({
                         type: "join_request_sent",
-                        message: "Join request sent to room creator"
+                        message: "Join request sent to room creator",
+                        userName: userName
                     }));
                 } else {
                     // No creator or creator is joining, auto-approve
@@ -185,8 +217,10 @@ wss.on("connection",(socket)=>{
                             avatar: avatar
                         });
                     }
-                    socket.send(JSON.stringify({type:"room_joined",roomId:roomId}));
+                    socket.send(JSON.stringify({type:"room_joined",roomId:roomId, userName: userName}));
                     broadcastUsersList(roomId);
+                    // Broadcast join message to all users in the room
+                    broadcastUserJoined(roomId, userName, avatar);
                 }
             }else{
                 socket.send(JSON.stringify({type:"error",message:"roomid dont exist you can create one"}));
@@ -202,34 +236,32 @@ wss.on("connection",(socket)=>{
                 const requestIndex = requests.findIndex(r => r.requestId === requestId);
                 if(requestIndex > -1){
                     const request = requests[requestIndex];
-                    // Add user to room
-                    allSockets.push({
-                        socket: request.socket,
-                        room: roomId,
-                        name: request.userName,
-                        avatar: request.avatar
-                    });
-                    
-                    // Notify user they were approved
-                    request.socket.send(JSON.stringify({
-                        type: "room_joined",
-                        roomId: roomId
-                    }));
-                    
-                    // Remove request from pending
-                    requests.splice(requestIndex, 1);
-                    pendingJoinRequests.set(roomId, requests);
-                    
-                    // Broadcast updated users list
-                    broadcastUsersList(roomId);
-                    
-                    // Notify creator request was handled
-                    const creator = roomCreators.get(roomId);
-                    if(creator){
-                        creator.send(JSON.stringify({
-                            type: "join_approved",
-                            requestId: requestId
+                    if(request){
+                        // Set approval key so user auto-joins when they reconnect from chat page
+                        const approvalKey = getApprovalKey(roomId, request.userName, request.avatar);
+                        approvedJoinKeys.add(approvalKey);
+                        setTimeout(() => approvedJoinKeys.delete(approvalKey), 60_000);
+                        
+                        // Notify user they were approved (DON'T add to allSockets yet —
+                        // they will join properly when their chat page WS connects)
+                        request.socket.send(JSON.stringify({
+                            type: "room_joined",
+                            roomId: roomId,
+                            userName: request.userName
                         }));
+                        
+                        // Remove request from pending
+                        requests.splice(requestIndex, 1);
+                        pendingJoinRequests.set(roomId, requests);
+                        
+                        // Notify creator request was handled
+                        const creator = roomCreators.get(roomId);
+                        if(creator){
+                            creator.send(JSON.stringify({
+                                type: "join_approved",
+                                requestId: requestId
+                            }));
+                        }
                     }
                 }
             }
@@ -244,24 +276,25 @@ wss.on("connection",(socket)=>{
                 const requestIndex = requests.findIndex(r => r.requestId === requestId);
                 if(requestIndex > -1){
                     const request = requests[requestIndex];
-                    
-                    // Notify user they were rejected
-                    request.socket.send(JSON.stringify({
-                        type: "join_rejected",
-                        message: "Not allowed"
-                    }));
-                    
-                    // Remove request from pending
-                    requests.splice(requestIndex, 1);
-                    pendingJoinRequests.set(roomId, requests);
-                    
-                    // Notify creator request was handled
-                    const creator = roomCreators.get(roomId);
-                    if(creator){
-                        creator.send(JSON.stringify({
+                    if(request){
+                        // Notify user they were rejected
+                        request.socket.send(JSON.stringify({
                             type: "join_rejected",
-                            requestId: requestId
+                            message: "Not allowed"
                         }));
+                        
+                        // Remove request from pending
+                        requests.splice(requestIndex, 1);
+                        pendingJoinRequests.set(roomId, requests);
+                        
+                        // Notify creator request was handled
+                        const creator = roomCreators.get(roomId);
+                        if(creator){
+                            creator.send(JSON.stringify({
+                                type: "join_rejected",
+                                requestId: requestId
+                            }));
+                        }
                     }
                 }
             }
@@ -289,6 +322,26 @@ wss.on("connection",(socket)=>{
                     type: "error",
                     message: "You must join a room before sending messages."
                 }));
+            }
+        }
+
+        if(parsedMessage.type==="typing"){
+            const currentUser=allSockets.find(u => u && u.socket === socket);
+            if(currentUser && currentUser.room){
+                const roomId=currentUser.room;
+                const typingData = {
+                    type: "typing",
+                    payload: {
+                        userName: currentUser.name,
+                        isTyping: parsedMessage.payload?.isTyping ?? false
+                    }
+                };
+                // Broadcast to all other users in the room
+                allSockets.forEach(user => {
+                    if(user && user.room === roomId && user.socket !== socket){
+                        user.socket.send(JSON.stringify(typingData));
+                    }
+                });
             }
         }
         } catch (error) {

@@ -304,12 +304,17 @@ wss.on("connection",(socket)=>{
             const currentUser=allSockets.find(u => u && u.socket === socket);
             if(currentUser && currentUser.room){
                 const roomId=currentUser.room;
+                const isGeminiResponse = parsedMessage.payload?.isGeminiResponse === true;
                 const messageData = {
                     type: "message",
                     payload: {
+                        messageId: parsedMessage.payload?.messageId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                         message: parsedMessage.payload.message,
-                        senderName: currentUser.name,
-                        senderAvatar: currentUser.avatar
+                        senderName: isGeminiResponse ? "Gemini AI" : currentUser.name,
+                        senderAvatar: isGeminiResponse ? 1 : currentUser.avatar,
+                        isGeminiResponse,
+                        imageUrl: parsedMessage.payload?.imageUrl,
+                        replyTo: parsedMessage.payload?.replyTo
                     }
                 };
                 allSockets.forEach(user => {
